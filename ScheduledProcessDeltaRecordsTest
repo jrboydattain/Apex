@@ -1,0 +1,11 @@
+@IsTest
+public class ScheduledProcessDeltaRecordsTest {
+
+    @IsTest
+    public static void testScheduledJob() {
+        Test.startTest();
+        String CRON_EXP = '0 0 0 3 9 ? 2042';
+        System.schedule('testJob', CRON_EXP, new ScheduledProcessDeltaRecords());
+        Test.stopTest();
+    }
+}
