@@ -1,0 +1,65 @@
+//Batch class used to facilitate the bulk change of fileds for a given SObject. The class implements Batchable base class and takes two parameters when invoked.
+//The SOQL query paramater is a string that must contain all fields intended to be modified
+//The fieldValueSet is string map of key-value pairs of Fields and what value to set it to
+//The class invokved batch processing to do a bulk update on all fetched records and updates the values on all to those provided in the passed map
+//This class should only be invokved on large data sets (>50,000)
+
+/* Example apex to invoke this class:
+
+String queryString = 'SELECT id, Status__c FROM Delegate__c WHERE RecordTypeId = \'0125x000000YQ9NAAW\'';
+Map<String, String> fieldValueSet = new Map<String, String>();
+fieldValueSet.put('FieldApiName','FieldValue');
+BatchReplaceFieldValue batchUpdate = new BatchReplaceFieldValue(queryString,fieldValueSet);
+Database.executeBatch(batchUpdate);
+
+*/
+
+Global without sharing class BatchReplaceFieldValue implements Database.batchable<sobject> {
+    //Global String of the SOQL; populated during construction
+    global final String query; 
+    global final Map<String, String> fieldValueSet;
+
+    //Class Constructor
+    global BatchReplaceFieldValue(String inputQuery, Map<String, String> inputFieldValueSet) {
+        query = inputQuery;
+        fieldValueSet = inputFieldValueSet;
+    }
+
+    //Start method; execute the query to get the records
+    global Database.QueryLocator start(Database.BatchableContext BC){
+        return Database.getQueryLocator(query);
+    }
+
+    //Execute method; Updates fields
+    global void execute(Database.BatchableContext BC, List<SObject> listOfRecordsToUpdate){
+        //Iterate over list of SObjects to process, replacing the value of the field for each one
+        for(SObject record : listOfRecordsToUpdate) {
+            System.debug('ID of manupulated record: ' + record.id);
+            //For each record, iterate over the field/value update map and update the values
+            for(String field : fieldValueSet.keyset()) {
+                String value = fieldValueSet.get(field);
+                System.debug('Passed Value: ' + value);
+                //If the field entry from input starts with a colon, this is a key char inidicating field API name. Look up the field on the object, get its value and set it to the
+                //new field
+                if(String.IsNotEmpty(value) && value.startsWith(':')) {
+                    String fieldApiName = value.replace(':','');
+                    record.put(field, record.get(fieldApiName));
+                } else if(value == 'True') {
+                    record.put(field, true);
+                } else if(value == 'False') {
+                    record.put(field, false);
+                } else {
+                    record.put(field, value);
+                }
+            }
+        }
+        //Once update to records has been made, commit them to the database
+        Database.update(listOfRecordsToUpdate);
+    }
+
+    //Finish method; post-batch run job tasks
+    global void finish(Database.BatchableContext BC){
+        //This class has no post batch-job processes (yet?), but we need to define this method to implement Database.batchable interface.
+        //Post-batch jobs, like emails or the like, can be put in here
+    }
+}
