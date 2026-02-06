@@ -1,0 +1,8 @@
+@IsTest
+public class BatchProcessDeltaRecordsTest {
+    @IsTest
+    public static void testBatchDeltaProcess() {
+        BatchProcessDeltaRecords nextObjectBatch = new BatchProcessDeltaRecords(0);
+        Database.executeBatch(nextObjectBatch, 20);
+    }
+}
