@@ -1,0 +1,33 @@
+//This batch class is used to batch up large bulk-deletions of records. Its can be called from both an Anon Apex script or a normal apex class. 
+//This class extends the batchable class
+//
+// String queryString = 'SELECT Id FROM Contact WHERE Name = \'Kevin Bacon\';
+// BatchMassDeleteRecords batchDelete = new BatchMassDeleteRecords(queryString);
+// Database.executeBatch(batchDelete);
+
+Global class BatchMassDeleteRecords implements Database.batchable<sobject> {
+    //Global String of the SOQL; populated during construction
+    global final String query; 
+
+    //Constructor to populate the query; the query should select all the records to delete
+    global BatchMassDeleteRecords(String inputQuery) {
+        query = inputQuery;
+    }
+
+    //Start method; execute the query to get the records to be deleted
+    global Database.QueryLocator start(Database.BatchableContext BC){
+        return Database.getQueryLocator(query);
+    }
+
+    //Execute method; does the delete of the records
+    global void execute(Database.BatchableContext BC, List<SObject> listOfRecordsToDelete){
+        //Some debugging to help troubleshoot the deletes via logs
+        delete listOfRecordsToDelete;
+    }
+
+    //Finish method; post-batch run job tasks
+    global void finish(Database.BatchableContext BC){
+        //This class has no post batch-job processes (yet?), but we need to define this method to implement Database.batchable interface.
+        //Post-batch jobs, like emails or the like, can be put in here
+    }
+}
