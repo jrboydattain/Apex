@@ -1,0 +1,456 @@
+/** ObjectRequiredFields
+ * Exports all required for a given sObject
+ * into a CSV saved in Files (My Files).
+ *
+ * CSV Columns (order):
+ *   Object API Name, Field API Name, Field API Name, Requirement
+ *    
+ * Usage:
+ * 	 - ObjectRequiredFields.exportForRecordType('Account', 'Vendor');
+ * 	 - ObjectRequiredFields.exportObject('Contact');	
+ *   - Saves the CSV as a ContentVersion in the running user's My Files. 
+ */
+public with sharing class ObjectRequiredFields {
+
+    // ======= Configuration =======
+    private static final Boolean DEBUG_DUMP_JSON = false;      // turn on only when troubleshooting
+    private static final Boolean DEBUG_DUMP_LOG = false;	  // turn on only when troubleshooting
+    private static final Integer LAYOUT_RETRIEVE_CHUNK = 20;   // batch size for Apex Metadata.retrieve
+
+    // ======= Small carriers =======
+    private class HttpResult { public Integer status; public String body; }
+    private class DumpDoc  { public String title; public String body; public DumpDoc(String t,String b){title=t;body=b;} }
+
+    public class ExportResult {
+        public String fileTitle;
+        public Id contentDocumentId;
+        public Integer rowCount;
+        public Integer fieldLevelCount;
+        public Integer platformCount;
+        public Integer layoutPairCount;
+        public Integer fieldsWithLayout;
+        public String notes;
+    }
+
+    // ========================= PUBLIC ENTRY POINTS =========================
+
+    /** Export required fields for ALL page layouts of the object. */
+    public static ExportResult exportObject(String objectApiName) {
+        return doExport(objectApiName, null);
+    }
+
+    /**
+     * Export required fields for all layouts assigned to the Record Type across profiles.
+     * (Falls back to the default RT layout if no profile-specific assignment exists.)
+     */
+    public static ExportResult exportForRecordType(String objectApiName, String recordTypeName) {
+        if (String.isBlank(recordTypeName)) {
+            throw new IllegalArgumentException('recordTypeName is required for exportForRecordType.');
+        }
+        return doExport(objectApiName, recordTypeName);
+    }
+
+    private static ExportResult doExport(String objectApiName, String recordTypeNameOpt) {
+        if (String.isBlank(objectApiName)) throw new IllegalArgumentException('Object API Name is required.');
+
+        // Normalize API name (case-insensitive)
+        Map<String, Schema.SObjectType> gd = Schema.getGlobalDescribe();
+        Schema.SObjectType sType = gd.get(objectApiName);
+        if (sType == null) {
+            for (String k : gd.keySet()) {
+                if (k.equalsIgnoreCase(objectApiName)) { sType = gd.get(k); objectApiName = k; break; }
+            }
+        }
+        if (sType == null) throw new IllegalArgumentException('Unknown object: ' + objectApiName);
+
+        // 1) Collect page-layout required fields via Apex Metadata Layouts
+        List<String> runLog = new List<String>();
+        List<DumpDoc> dumps = new List<DumpDoc>();
+        String notes = null;
+
+        // Field API → Set<Label> (label = "<Layout Name>" or "<Layout Name> (RT: X)")
+        Map<String, Set<String>> layoutRequiredByField = new Map<String, Set<String>>();
+
+        if (String.isBlank(recordTypeNameOpt)) {
+            // OBJECT-LEVEL: enumerate ALL layouts and parse each one
+            Map<String,String> idToName = toolingListLayouts(objectApiName, runLog, dumps);
+            if (!idToName.isEmpty()) {
+                List<String> allFullNames = new List<String>();
+                for (String lname : idToName.values()) {
+                    allFullNames.add(objectApiName + '-' + lname);
+                }
+                retrieveAndParseLayouts(allFullNames, null, layoutRequiredByField);
+            } else {
+                notes = appendNote(notes, 'No layouts returned by Tooling for object ' + objectApiName);
+            }
+        } else {
+            // RECORD TYPE-LEVEL: include ALL layouts assigned to this RT across profiles (ProfileLayout)
+            String api = 'v60.0';
+            String path = '/services/data/' + api + '/sobjects/' + EncodingUtil.urlEncode(objectApiName,'UTF-8') + '/describe/layouts/';
+            HttpResult top = httpGet(path);
+            runLog.add('GET ' + path + ' → ' + top.status);
+
+            String rtId = null, defaultLayoutId = null;
+            if (top.status >=200 && top.status <300 && String.isNotBlank(top.body)) {
+                Map<String,Object> root = (Map<String,Object>) JSON.deserializeUntyped(top.body);
+                List<Object> rtMaps = (List<Object>) root.get('recordTypeMappings');
+
+                String matchBy = recordTypeNameOpt.toLowerCase();
+                if (rtMaps != null) {
+                    for (Object rAny : rtMaps) {
+                        Map<String,Object> r = (Map<String,Object>) rAny;
+                        String name  = (String) r.get('name');
+                        String dev   = (String) r.get('developerName');
+                        String n1 = name != null ? name.toLowerCase() : null;
+                        String n2 = dev  != null ? dev.toLowerCase()  : null;
+                        if (matchBy.equals(n1) || matchBy.equals(n2)) {
+                            rtId = (String) r.get('recordTypeId');
+                            defaultLayoutId = (String) r.get('layoutId');
+                            break;
+                        }
+                    }
+                }
+            } else {
+                notes = appendNote(notes, 'Layouts describe failed for RT mapping: HTTP ' + top.status);
+            }
+
+            if (String.isBlank(rtId)) {
+                notes = appendNote(notes, 'Record Type "' + recordTypeNameOpt + '" not found on ' + objectApiName + '.');
+            } else {
+                Set<String> layoutIds = toolingListLayoutsForRecordType(objectApiName, rtId, runLog, dumps); // ProfileLayout
+                if (layoutIds.isEmpty() && String.isNotBlank(defaultLayoutId)) layoutIds.add(defaultLayoutId);
+
+                if (layoutIds.isEmpty()) {
+                    notes = appendNote(notes, 'No layouts found for RT ' + recordTypeNameOpt + ' on ' + objectApiName + '.');
+                } else {
+                    Map<String,String> idToName = toolingLayoutNamesByIds(layoutIds, runLog);
+                    List<String> fullNames = new List<String>();
+                    for (String lid : idToName.keySet()) {
+                        fullNames.add(objectApiName + '-' + idToName.get(lid));
+                    }
+                    //retrieveAndParseLayouts(fullNames, '(' + 'RT: ' + recordTypeNameOpt + ')', layoutRequiredByField);
+                    retrieveAndParseLayouts(fullNames, '', layoutRequiredByField);
+                }
+            }
+        }
+
+        // 2) Schema-derived Field Level vs Platform
+        Schema.DescribeSObjectResult sDesc = sType.getDescribe();
+        Map<String, Schema.SObjectField> fieldMap = sDesc.fields.getMap();
+
+        Set<String> fieldLevel = new Set<String>(); // custom & non-nullable & createable & not checkbox & not formula
+        Set<String> platform   = new Set<String>(); // standard non-nullable & createable
+
+        for (String fName : fieldMap.keySet()) {
+            Schema.DescribeFieldResult f = fieldMap.get(fName).getDescribe();
+
+            Boolean createable = f.isCreateable();
+            Boolean nillable   = f.isNillable();
+            Boolean isFormula  = f.isCalculated();
+            Boolean isCheckbox = (f.getType() == Schema.DisplayType.Boolean);
+
+            if (!createable) continue;
+            if (!nillable && !isFormula) {
+                if (isCheckbox) continue; // checkbox non-nullable != “Required” in OM sense
+                if (fName.endsWith('__c')) fieldLevel.add(fName);
+                else platform.add(fName);
+            }
+        }
+
+        // 3) Build CSV (single row per field; aggregate “Requirement”)
+        List<String> lines = new List<String>();
+        lines.add('Object API Name,Field API Name,Requirement');
+
+        Integer rowCount = 0;
+        Integer fieldLevelCount = 0;
+        Integer platformCount   = 0;
+        Integer layoutPairCount = 0;
+        Integer fieldsWithLayout = 0;
+
+        Set<String> union = new Set<String>();
+        union.addAll(fieldMap.keySet());
+        union.addAll(layoutRequiredByField.keySet());
+
+        List<String> allFieldNames = new List<String>(union);
+        allFieldNames.sort();
+
+        for (String fName : allFieldNames) {
+            List<String> parts = new List<String>();
+
+            if (fieldLevel.contains(fName)) { parts.add('Field Level'); fieldLevelCount++; }
+            if (!fieldLevel.contains(fName) && platform.contains(fName)) { parts.add('Platform'); platformCount++; }
+
+            if (layoutRequiredByField.containsKey(fName)) {
+                List<String> ln = new List<String>(layoutRequiredByField.get(fName));
+                ln.sort();
+                if (!ln.isEmpty()) {
+                    parts.addAll(ln);
+                    layoutPairCount += ln.size();
+                    fieldsWithLayout++;
+                }
+            }
+
+            if (!parts.isEmpty()) {
+                lines.add(csvSafe(objectApiName) + ',' + csvSafe(fName) + ',' + csvSafe(String.join(parts, '; ')));
+                rowCount++;
+            }
+        }
+
+        if (rowCount == 0) {
+            lines.add('# No required fields found for ' + objectApiName + ' (field-level/layout/platform).');
+            if (notes != null) lines.add('# Notes: ' + notes);
+        } else if (notes != null) {
+            lines.add('# Notes: ' + notes);
+        }
+
+        // 4) DML LAST: write run log (and optional dumps) + CSV
+        String timestamp = Datetime.now().format('yyyyMMdd_HHmmss');
+
+        if (DEBUG_DUMP_JSON) {
+            for (DumpDoc d : dumps) insertFile(d.title, d.title + '.json', d.body);
+        }
+
+        if(DEBUG_DUMP_LOG) {
+            insertFile(
+            objectApiName + '_RequiredFields_RunLog_' + timestamp,
+            objectApiName + '_RequiredFields_RunLog_' + timestamp + '.txt',
+            String.join(runLog, '\n')
+        	);            
+        }        
+
+        String baseTitle = (String.isBlank(recordTypeNameOpt))
+            ? (objectApiName + '_RequiredFields_' + timestamp)
+            : (objectApiName + '_' + recordTypeNameOpt + 'RequiredFields_' + timestamp);
+
+        Id csvVersionId = insertFile(baseTitle, baseTitle + '.csv', String.join(lines, '\n'));
+
+        ContentVersion insertedCv = [
+            SELECT Id, ContentDocumentId
+            FROM ContentVersion
+            WHERE Id = :csvVersionId
+            LIMIT 1
+        ];
+
+        ExportResult out = new ExportResult();
+        out.fileTitle = baseTitle + '.csv';
+        out.contentDocumentId = insertedCv.ContentDocumentId;
+        out.rowCount = rowCount;
+        out.fieldLevelCount = fieldLevelCount;
+        out.platformCount = platformCount;
+        out.layoutPairCount = layoutPairCount;
+        out.fieldsWithLayout = fieldsWithLayout;
+        out.notes = notes;
+        return out;
+    }
+
+    // ========================= LAYOUT ENUMERATION =========================
+
+    // List ALL page layouts for the object via Tooling (Id → Name).  (Layout.TableEnumOrId conventions)
+    private static Map<String,String> toolingListLayouts(String objectApiName, List<String> runLog, List<DumpDoc> dumps) {
+        Map<String,String> idToName = new Map<String,String>();
+
+        String discriminator = objectApiName; // std objects use API name; custom uses CustomObject.Id  [7](https://salesforce.stackexchange.com/questions/277859/is-there-a-way-we-can-get-layout-info-in-lwc-by-just-passing-recordtypeid-and-ob)
+        if (objectApiName.endsWith('__c')) {
+            String devName = objectApiName.substring(0, objectApiName.length()-3);
+            String soql = 'SELECT Id FROM CustomObject WHERE DeveloperName = \'' + escapeSOQL(devName) + '\'';
+            String path = '/services/data/v60.0/tooling/query/?q=' + enc(soql);
+            HttpResult co = httpGet(path);
+            runLog.add('GET ' + path + ' (Tooling CustomObject) → ' + co.status);
+            if (DEBUG_DUMP_JSON) dumps.add(new DumpDoc(objectApiName+'_tooling_customobject', bodyOrEmpty(co.body)));
+            if (co.status>=200 && co.status<300 && String.isNotBlank(co.body)) {
+                Map<String,Object> root = (Map<String,Object>) JSON.deserializeUntyped(co.body);
+                List<Object> recs = (List<Object>) root.get('records');
+                if (recs != null && !recs.isEmpty()) {
+                    Map<String,Object> rec0 = (Map<String,Object>) recs[0];
+                    Object idVal = rec0.get('Id');
+                    if (idVal != null) discriminator = String.valueOf(idVal);
+                }
+            }
+        }
+
+        String listSoql = 'SELECT Id, Name FROM Layout WHERE TableEnumOrId = \'' + escapeSOQL(discriminator) + '\'';
+        String listPath = '/services/data/v60.0/tooling/query/?q=' + enc(listSoql);
+        HttpResult li = httpGet(listPath);
+        runLog.add('GET ' + listPath + ' (Tooling Layout list) → ' + li.status);
+
+        if (li.status>=200 && li.status<300 && String.isNotBlank(li.body)) {
+            Map<String,Object> root = (Map<String,Object>) JSON.deserializeUntyped(li.body);
+            List<Object> recs = (List<Object>) root.get('records');
+            if (recs != null) {
+                for (Object recAny : recs) {
+                    Map<String,Object> rec = (Map<String,Object>) recAny;
+                    String id = (String) rec.get('Id');
+                    String name = (String) rec.get('Name');
+                    if (String.isNotBlank(id) && String.isNotBlank(name)) idToName.put(id, name);
+                }
+            }
+        }
+        return idToName;
+    }
+
+    // For a given Record Type, list ALL assigned layouts across profiles via Tooling ProfileLayout.  [3](https://salesforce.stackexchange.com/questions/421901/get-a-list-of-things)
+    private static Set<String> toolingListLayoutsForRecordType(String objectApiName, String recordTypeId, List<String> runLog, List<DumpDoc> dumps) {
+        Set<String> layoutIds = new Set<String>();
+
+        String discriminator = objectApiName; // std = API name; custom = CustomObject.Id  [7](https://salesforce.stackexchange.com/questions/277859/is-there-a-way-we-can-get-layout-info-in-lwc-by-just-passing-recordtypeid-and-ob)
+        if (objectApiName.endsWith('__c')) {
+            String devName = objectApiName.substring(0, objectApiName.length()-3);
+            String soql = 'SELECT Id FROM CustomObject WHERE DeveloperName = \'' + escapeSOQL(devName) + '\'';
+            String path = '/services/data/v60.0/tooling/query/?q=' + enc(soql);
+            HttpResult co = httpGet(path);
+            runLog.add('GET ' + path + ' (Tooling CustomObject) → ' + co.status);
+            if (co.status>=200 && co.status<300 && String.isNotBlank(co.body)) {
+                Map<String,Object> root = (Map<String,Object>) JSON.deserializeUntyped(co.body);
+                List<Object> recs = (List<Object>) root.get('records');
+                if (recs != null && !recs.isEmpty()) {
+                    Map<String,Object> rec0 = (Map<String,Object>) recs[0];
+                    Object idVal = rec0.get('Id');
+                    if (idVal != null) discriminator = String.valueOf(idVal);
+                }
+            }
+        }
+
+        String plSoql = 'SELECT LayoutId FROM ProfileLayout WHERE TableEnumOrId = \'' + escapeSOQL(discriminator) +
+                        '\' AND RecordTypeId = \'' + escapeSOQL(recordTypeId) + '\'';
+        String plPath = '/services/data/v60.0/tooling/query/?q=' + enc(plSoql);
+        HttpResult pl = httpGet(plPath);
+        runLog.add('GET ' + plPath + ' (Tooling ProfileLayout list) → ' + pl.status);
+
+        if (pl.status>=200 && pl.status<300 && String.isNotBlank(pl.body)) {
+            Map<String,Object> root = (Map<String,Object>) JSON.deserializeUntyped(pl.body);
+            List<Object> recs = (List<Object>) root.get('records');
+            if (recs != null) {
+                for (Object recAny : recs) {
+                    Map<String,Object> rec = (Map<String,Object>) recAny;
+                    String lid = (String) rec.get('LayoutId');
+                    if (String.isNotBlank(lid)) layoutIds.add(lid);
+                }
+            }
+        }
+        return layoutIds;
+    }
+
+    // Resolve many Layout.Id → Layout.Name via Tooling.  [7](https://salesforce.stackexchange.com/questions/277859/is-there-a-way-we-can-get-layout-info-in-lwc-by-just-passing-recordtypeid-and-ob)
+    private static Map<String,String> toolingLayoutNamesByIds(Set<String> ids, List<String> runLog) {
+        Map<String,String> mapOut = new Map<String,String>();
+        if (ids == null || ids.isEmpty()) return mapOut;
+
+        List<String> idList = new List<String>(ids);
+        Integer chunk = 150;
+        for (Integer i = 0; i < idList.size(); i += chunk) {
+            Integer endIdx = Math.min(i + chunk, idList.size());
+            List<String> slice = new List<String>();
+            for (Integer j = i; j < endIdx; j++) slice.add(idList[j]);
+
+            String inList = String.join(slice, '\',\'');
+            String soql = 'SELECT Id, Name FROM Layout WHERE Id IN (\'' + inList + '\')';
+            String path = '/services/data/v60.0/tooling/query/?q=' + enc(soql);
+            HttpResult hr = httpGet(path);
+            runLog.add('GET ' + path + ' (Tooling Layout Names) → ' + hr.status);
+
+            if (hr.status>=200 && hr.status<300 && String.isNotBlank(hr.body)) {
+                Map<String,Object> root = (Map<String,Object>) JSON.deserializeUntyped(hr.body);
+                List<Object> recs = (List<Object>) root.get('records');
+                if (recs != null) {
+                    for (Object recAny : recs) {
+                        Map<String,Object> rec = (Map<String,Object>) recAny;
+                        String id   = (String) rec.get('Id');
+                        String name = (String) rec.get('Name');
+                        if (String.isNotBlank(id) && String.isNotBlank(name)) mapOut.put(id, name);
+                    }
+                }
+            }
+        }
+        return mapOut;
+    }
+
+    // ========================= LAYOUT PARSING (Apex Metadata) =========================
+
+    // Retrieve layout metadata in chunks via Apex Metadata; parse items with behavior==Required.  [1](https://developer.salesforce.com/docs/atlas.en-us.uiapi.meta/uiapi/ui_api_requests_list_info_post_input.htm)
+    private static void retrieveAndParseLayouts(
+        List<String> fullNames,
+        String rtSuffixLabel,                   // e.g., "(RT: Organization)" or null
+        Map<String, Set<String>> acc
+    ) {
+        if (fullNames == null || fullNames.isEmpty()) return;
+
+        for (Integer i = 0; i < fullNames.size(); i += LAYOUT_RETRIEVE_CHUNK) {
+            Integer endIdx = Math.min(i + LAYOUT_RETRIEVE_CHUNK, fullNames.size());
+            List<String> slice = new List<String>();
+            for (Integer j = i; j < endIdx; j++) slice.add(fullNames[j]);
+
+            List<Metadata.Metadata> components =
+                Metadata.Operations.retrieve(Metadata.MetadataType.Layout, slice);
+
+            Integer idx = 0;
+            for (Metadata.Metadata mm : components) {
+                Metadata.Layout layoutMeta = (Metadata.Layout) mm;
+                String fullName = slice[idx++];
+                String layoutName = (fullName != null && fullName.contains('-'))
+                    ? fullName.substring(fullName.indexOf('-') + 1)
+                    : fullName;
+
+                String label = layoutName + (rtSuffixLabel != null ? ' ' + rtSuffixLabel : '');
+
+                if (layoutMeta != null && layoutMeta.layoutSections != null) {
+                    for (Metadata.LayoutSection sec : layoutMeta.layoutSections) {
+                        if (sec == null || sec.layoutColumns == null) continue;
+                        for (Metadata.LayoutColumn col : sec.layoutColumns) {
+                            if (col == null || col.layoutItems == null) continue;
+                            for (Metadata.LayoutItem item : col.layoutItems) {
+                                if (item == null) continue;
+
+                                // Authoritative signal: behavior == Required  [1](https://developer.salesforce.com/docs/atlas.en-us.uiapi.meta/uiapi/ui_api_requests_list_info_post_input.htm)
+                                if (item.behavior == Metadata.UiBehavior.Required && !String.isBlank(item.field)) {
+                                    if (!acc.containsKey(item.field)) acc.put(item.field, new Set<String>());
+                                    acc.get(item.field).add(label);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ========================= HTTP & FILE HELPERS =========================
+
+    private static HttpResult httpGet(String path) {
+        Http http = new Http();
+        HttpRequest req = new HttpRequest();
+        req.setMethod('GET');
+        String base = URL.getOrgDomainUrl().toExternalForm();
+        req.setEndpoint(base + path);
+        req.setHeader('Content-Type', 'application/json');
+        req.setHeader('Authorization', 'Bearer ' + UserInfo.getSessionId());
+        HttpResponse res = http.send(req);
+
+        HttpResult hr = new HttpResult();
+        hr.status = res.getStatusCode();
+        hr.body   = res.getBody();
+        return hr;
+    }
+
+    private static Id insertFile(String title, String pathOnClient, String body) {
+        ContentVersion cv = new ContentVersion();
+        cv.Title = title;
+        cv.PathOnClient = pathOnClient;
+        cv.VersionData = Blob.valueOf(body == null ? '' : body);
+        cv.FirstPublishLocationId = UserInfo.getUserId(); // My Files
+        insert cv;
+        return cv.Id;
+    }
+
+    // ========================= UTILITIES =========================
+
+    private static String csvSafe(String s) {
+        if (s == null) return '';
+        Boolean quote = s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') || s.contains(';');
+        String v = s.replace('"','""');
+        return quote ? ('"' + v + '"') : v;
+    }
+    private static String enc(String s){ return EncodingUtil.urlEncode(s,'UTF-8').replace('+','%20'); }
+    private static String escapeSOQL(String s){ return String.isBlank(s) ? '' : s.replace('\'','\\\''); }
+    private static String appendNote(String notes, String msg){ return (notes == null) ? msg : (notes + ' | ' + msg); }
+    private static String bodyOrEmpty(String b){ return b==null? '' : b; }
+}
