@@ -1,0 +1,134 @@
+/** ObjectPicklistValues
+ * Exports all picklist and multi-select picklist values for a given sObject
+ * into a CSV saved in Files (My Files).
+ *
+ * CSV Columns (order):
+ *   Object API Name, Field Label, Field API Name, Restricted, Active Values, Inactive Values
+ *     - Restricted: "Yes" if the field is a restricted picklist; otherwise "No"
+ *     - Active/Inactive Values: semicolon-separated lists of API values
+ * Usage:
+ * 	 - Id docId = ObjectPicklistValues.export('Account');
+ *   - System.debug('CSV created in My Files. ContentDocumentId = ' + docId + ' (Open: /' + docId + ')');
+ * Behavior:
+ *   - Includes both Picklist and Multi-Select Picklist fields.
+ *   - Uses Schema.Describe to retrieve ALL defined values; separates by isActive().
+ *   - Saves the CSV as a ContentVersion in the running user's My Files.
+ *
+ * Returns:
+ *   ContentDocumentId of the created file.
+ */
+public with sharing class ObjectPicklistValues {
+
+    /**
+     * Export picklist values for the specified object into a CSV.
+     * @param sObjectApiName API name of the object (e.g., 'Account', 'MyObject__c')
+     * @return Id ContentDocumentId of the created file in My Files.
+     */
+    public static Id export(String sObjectApiName) {
+        if (String.isBlank(sObjectApiName)) {
+            throw new IllegalArgumentException('sObject API name is required.');
+        }
+
+        // Resolve sObject type
+        Schema.SObjectType sType = Schema.getGlobalDescribe().get(sObjectApiName);
+        if (sType == null) {
+            throw new IllegalArgumentException('Unknown sObject: ' + sObjectApiName);
+        }
+
+        Schema.DescribeSObjectResult objDescribe = sType.getDescribe();
+
+        // Gather picklist + multipicklist fields
+        Map<String, Schema.SObjectField> fieldMap = objDescribe.fields.getMap();
+        List<Schema.SObjectField> picklistFields = new List<Schema.SObjectField>();
+        for (Schema.SObjectField token : fieldMap.values()) {
+            Schema.DescribeFieldResult f = token.getDescribe();
+            Schema.DisplayType t = f.getType();
+            if (t == Schema.DisplayType.Picklist || t == Schema.DisplayType.MultiPicklist) {
+                picklistFields.add(token);
+            }
+        }
+
+        // Build CSV using a list of rows
+        List<String> rows = new List<String>();
+        rows.add('Object API Name,Field Label,Field API Name,Restricted,Active Values,Inactive Values');
+
+        for (Schema.SObjectField token : picklistFields) {
+            Schema.DescribeFieldResult f = token.getDescribe();
+
+            // Separate active vs inactive using DescribeFieldResult.getPicklistValues()
+            Set<String> activeVals = new Set<String>();
+            Set<String> inactiveVals = new Set<String>();
+
+            for (Schema.PicklistEntry pe : f.getPicklistValues()) {
+                if (pe == null) continue;
+                String v = pe.getValue();
+                if (String.isBlank(v)) continue;
+
+                if (pe.isActive()) {
+                    activeVals.add(v);
+                } else {
+                    inactiveVals.add(v);
+                }
+            }
+
+            // Sort for consistent output
+            List<String> activeSorted = new List<String>(activeVals);
+            List<String> inactiveSorted = new List<String>(inactiveVals);
+            activeSorted.sort();
+            inactiveSorted.sort();
+
+            // Join with semicolons
+            String activeJoined = String.join(activeSorted, ';');
+            String inactiveJoined = String.join(inactiveSorted, ';');
+
+            // Restricted picklist?
+            String restricted = f.isRestrictedPicklist() ? 'Yes' : 'No';
+
+            // Compose row (Field Label before Field API Name, then Restricted)
+            String row =
+                csvEscape(sObjectApiName) + ',' +
+                csvEscape(f.getLabel()) + ',' +
+                csvEscape(f.getName()) + ',' +
+                csvEscape(restricted) + ',' +
+                csvEscape(activeJoined) + ',' +
+                csvEscape(inactiveJoined);
+
+            rows.add(row);
+        }
+
+        // Final CSV content
+        String csv = String.join(rows, '\n') + '\n';
+
+        // Create file in My Files with naming format: [ObjectAPIName]_Picklists__YYYYMMDD_HHMMSS.csv
+        String ts = DateTime.now().format('yyyyMMdd_HHmmss');
+        String baseName = sObjectApiName + '_Picklists__' + ts;
+
+        ContentVersion cv = new ContentVersion();
+        cv.Title = baseName;
+        cv.PathOnClient = baseName + '.csv';
+        cv.VersionData = Blob.valueOf(csv);
+        // Not setting FirstPublishLocationId ensures it lands in "My Files"
+        insert cv;
+
+        // Return ContentDocumentId
+        cv = [
+            SELECT Id, ContentDocumentId
+            FROM ContentVersion
+            WHERE Id = :cv.Id
+            LIMIT 1
+        ];
+        return cv.ContentDocumentId;
+    }
+
+    /**
+     * CSV escape utility:
+     * - Double quotes become doubled: " -> ""
+     * - Values containing comma, quote, or newline are wrapped in quotes
+     */
+    private static String csvEscape(String val) {
+        if (val == null) return '""';
+        Boolean needsQuoting = val.contains(',') || val.contains('"') || val.contains('\n') || val.contains('\r');
+        String safe = val.replace('"', '""');
+        return needsQuoting ? '"' + safe + '"' : safe;
+    }
+}
