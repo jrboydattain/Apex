@@ -1,0 +1,7 @@
+global class ScheduledProcessDeltaRecords implements Schedulable {
+    global void execute(SchedulableContext SC) {
+        //Start the Delta batch at index 0 (Constituent). This will cycle through a series of sequenced batch jobs to process deltas for all objects
+        BatchProcessDeltaRecords startDeltaBatch = new BatchProcessDeltaRecords(0);
+        Database.executeBatch(startDeltaBatch, 20);
+    }
+}
