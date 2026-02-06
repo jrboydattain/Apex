@@ -1,0 +1,229 @@
+/** ObjectFieldWhereUsed
+ * 
+ * Aggregates "Where is this used?" (Dependency API via Tooling API) for ALL custom fields
+ * on ANY sObject API name (e.g., 'Contact', 'Account', 'MyObject__c'),
+ * and can SAVE the resulting CSV to Salesforce Files (optionally linking it to a record).
+ *
+ * CSV COLUMNS:
+ *   ObjectApiName,FieldApiName,UsageType,UsageName
+ *
+ * Usage:
+ *   // 1) Just return CSV in the log:
+ *   System.debug(ObjectFieldWhereUsed.runForObject('Contact'));
+ *
+ *   // 2) Save CSV to Files (My Files) and return the ContentVersion.Id:
+ *   Id cvId = ObjectFieldWhereUsed.runForObjectAndSave('Contact', null);
+ *   System.debug('Saved file ContentVersion Id: ' + cvId);
+ *
+ *   // 3) Save CSV to Files and link it to a record (e.g., an Account):
+ *   Id linkedCvId = ObjectFieldWhereUsed.runForObjectAndSave('Contact', '001xxxxxxxxxxxx');
+ *   System.debug('Saved & linked ContentVersion Id: ' + linkedCvId);
+ *
+ * NOTES:
+ *   - Dependency API (MetadataComponentDependency) primarily supports CUSTOM fields (not standard fields). [Same backend as the UI button]
+ *   - Uses Tooling REST from Apex at /services/data/vXX.X/tooling/query/?q=... (Bearer = session id).
+ *   - If you see a "callout not allowed" error, add a Remote Site Setting for your org base URL.
+ */
+public with sharing class ObjectFieldWhereUsed {
+
+    /**
+     * Return the CSV for all custom fields on the object.
+     */
+    public static String runForObject(String objectApiName) {
+        if (String.isBlank(objectApiName)) {
+            return 'ObjectApiName,FieldApiName,UsageType,UsageName\n';
+        }
+
+        final String base = URL.getOrgDomainUrl().toExternalForm(); // v59+ supported
+        final String apiVersion = 'v65.0';
+
+        // (1) Query object's custom fields via Tooling API (avoid FullName/Metadata in bulk queries).
+        //     We now include NamespacePrefix so we can compose a namespaced API name.  [CustomField doc]
+        List<Map<String, Object>> cfRecords = queryAllTooling(
+            base, apiVersion,
+            'SELECT Id, DeveloperName, NamespacePrefix ' +
+            'FROM CustomField ' +
+            'WHERE TableEnumOrId = \'' + objectApiName + '\''
+        );
+
+        // (2) Fallback: query by DurableId
+        if (cfRecords.isEmpty()) {
+            String durableId = resolveEntityDurableId(base, apiVersion, objectApiName);
+            if (String.isNotBlank(durableId)) {
+                cfRecords = queryAllTooling(
+                    base, apiVersion,
+                    'SELECT Id, DeveloperName, NamespacePrefix ' +
+                    'FROM CustomField ' +
+                    'WHERE TableEnumOrId = \'' + durableId + '\''
+                );
+            }
+        }
+
+        if (cfRecords.isEmpty()) {
+            System.debug('No custom fields found for object: ' + objectApiName);
+            return 'ObjectApiName,FieldApiName,UsageType,UsageName\n';
+        }
+
+        // Maps: fieldId -> DeveloperName / NamespacePrefix
+        Map<String, String> fieldIdToDevName = new Map<String, String>();
+        Map<String, String> fieldIdToNs      = new Map<String, String>();
+        for (Map<String, Object> r : cfRecords) {
+            fieldIdToDevName.put((String) r.get('Id'), (String) r.get('DeveloperName'));
+            fieldIdToNs.put((String) r.get('Id'), (String) r.get('NamespacePrefix')); // may be null for non‑managed fields
+        }
+
+        // (3) Query Dependency API (MetadataComponentDependency) in batches
+        List<String> allIds = new List<String>(fieldIdToDevName.keySet());
+        Integer batchSize = 100;
+        Map<String, List<Map<String,String>>> aggregate = new Map<String, List<Map<String,String>>>();
+
+        for (Integer i = 0; i < allIds.size(); i += batchSize) {
+            Integer endExclusive = Math.min(i + batchSize, allIds.size());
+            List<String> chunk = new List<String>();
+            for (Integer j = i; j < endExclusive; j++) chunk.add(allIds[j]);
+
+            List<String> quoted = new List<String>();
+            for (String cid : chunk) quoted.add('\'' + cid + '\'');
+
+            String depSoql =
+                'SELECT MetadataComponentType, MetadataComponentName, ' +
+                '       RefMetadataComponentType, RefMetadataComponentName, RefMetadataComponentId ' +
+                'FROM MetadataComponentDependency ' +
+                'WHERE RefMetadataComponentType = \'CustomField\' ' +
+                '  AND RefMetadataComponentId IN (' + String.join(quoted, ',') + ') ' +
+                'ORDER BY RefMetadataComponentId, MetadataComponentType, MetadataComponentName';
+
+            List<Map<String, Object>> depRows = queryAllTooling(base, apiVersion, depSoql);
+
+            for (Map<String, Object> row : depRows) {
+                String refId     = (String) row.get('RefMetadataComponentId');
+                String usageType = (String) row.get('MetadataComponentType');
+                String usageName = (String) row.get('MetadataComponentName');
+
+                List<Map<String,String>> bucket = aggregate.get(refId);
+                if (bucket == null) {
+                    bucket = new List<Map<String,String>>();
+                    aggregate.put(refId, bucket);
+                }
+                Map<String,String> u = new Map<String,String>();
+                u.put('UsageType', usageType);
+                u.put('UsageName', usageName);
+                bucket.add(u);
+            }
+        }
+
+        // (4) Build CSV with namespaced FieldApiName:
+        //     FieldApiName = (NamespacePrefix != null ? NamespacePrefix + '__' : '') + DeveloperName + '__c'
+        List<String> lines = new List<String>();
+        lines.add('ObjectApiName,FieldApiName,UsageType,UsageName');
+
+        for (String fieldId : aggregate.keySet()) {
+            String devName = fieldIdToDevName.get(fieldId);
+            String ns      = fieldIdToNs.get(fieldId);
+            String fieldApiName = (String.isBlank(devName))
+                                  ? ''
+                                  : ((String.isBlank(ns) ? '' : ns + '__') + devName + '__c');
+
+            for (Map<String,String> u : aggregate.get(fieldId)) {
+                lines.add(
+                    escapeCsv(objectApiName) + ',' +
+                    escapeCsv(fieldApiName) + ',' +
+                    escapeCsv(u.get('UsageType')) + ',' +
+                    escapeCsv(u.get('UsageName'))
+                );
+            }
+        }
+
+        System.debug('Object: ' + objectApiName +
+                     ' | Custom fields: ' + cfRecords.size() +
+                     ' | Fields with >=1 usage: ' + aggregate.size());
+        return String.join(lines, '\n') + '\n';
+    }
+
+    /**
+     * Build CSV and SAVE it as a Salesforce File (My Files).
+     * If linkToRecordId is provided, the file is also linked to that record.
+     * Returns the new ContentVersion Id.
+     */
+    public static Id runForObjectAndSave(String objectApiName, Id linkToRecordId) {
+        String csv = runForObject(objectApiName);
+
+        String timestamp = Datetime.now().format('yyyy-MM-dd_HH-mm-ss');
+        String safeName  = objectApiName.replace('/', '_');
+        String title     = safeName + '_where-used_' + timestamp;
+        String path      = title + '.csv';
+
+        ContentVersion cv = new ContentVersion();
+        cv.Title        = title;
+        cv.PathOnClient = path;
+        cv.VersionData  = Blob.valueOf(csv);
+        insert cv; // creates the File in My Files  
+
+        if (linkToRecordId != null) {
+            ContentVersion inserted = [
+                SELECT Id, ContentDocumentId
+                FROM ContentVersion
+                WHERE Id = :cv.Id
+                LIMIT 1
+            ];
+            ContentDocumentLink cdl = new ContentDocumentLink();
+            cdl.ContentDocumentId = inserted.ContentDocumentId;
+            cdl.LinkedEntityId    = linkToRecordId;
+            cdl.ShareType         = 'V';
+            insert cdl; // link File to a record  
+        }
+        return cv.Id;
+    }
+
+    // ---- Resolve EntityDefinition DurableId for an object API name ----
+    private static String resolveEntityDurableId(String base, String apiVersion, String objectApiName) {
+        String soql = 'SELECT DurableId ' +
+                      'FROM EntityDefinition ' +
+                      'WHERE QualifiedApiName = \'' + objectApiName + '\'';
+        List<Map<String, Object>> rows = queryAllTooling(base, apiVersion, soql);
+        if (!rows.isEmpty()) {
+            return (String) rows[0].get('DurableId');
+        }
+        return null;
+    }
+
+    // ---- Tooling query with paging (returns all records) ----
+    private static List<Map<String, Object>> queryAllTooling(String base, String apiVersion, String soql) {
+        List<Map<String, Object>> out = new List<Map<String, Object>>();
+        String endpoint = base + '/services/data/' + apiVersion + '/tooling/query/?q=' +
+                          EncodingUtil.urlEncode(soql, 'UTF-8'); // Tooling REST pattern  
+        while (endpoint != null) {
+            Map<String, Object> page = sendGet(endpoint);
+            List<Object> recs = (List<Object>) page.get('records');
+            if (recs != null) {
+                for (Object o : recs) out.add((Map<String, Object>) o);
+            }
+            String nextUrl = (String) page.get('nextRecordsUrl');
+            endpoint = (String.isBlank(nextUrl)) ? null : base + nextUrl;
+        }
+        return out;
+    }
+
+    // ---- Raw GET to Tooling REST, returns parsed JSON ----
+    private static Map<String, Object> sendGet(String endpoint) {
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint(endpoint);
+        req.setMethod('GET');
+        req.setHeader('Authorization', 'Bearer ' + UserInfo.getSessionId());
+        req.setHeader('Accept', 'application/json');
+        Http http = new Http();
+        HttpResponse res = http.send(req);
+        if (res.getStatusCode() >= 300) {
+            throw new CalloutException('Tooling API error ' + res.getStatus() + ' at ' + endpoint + ' -> ' + res.getBody());
+        }
+        return (Map<String, Object>) JSON.deserializeUntyped(res.getBody());
+    }
+
+    // ---- CSV escaper ----
+    private static String escapeCsv(String s) {
+        if (s == null) return '';
+        Boolean needsQuotes = s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r');
+        String v = s.replace('"', '""');
+        return needsQuotes ? '"' + v + '"' : v;
+    }
+}
