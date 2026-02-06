@@ -1,0 +1,65 @@
+global class BatchProcessDeltaRecords implements Database.batchable<sobject> {
+    //Global String of the SOQL; populated during construction
+    global final List<String> objectToProcess = new List<String> {
+        'Constituent',
+        'Constituent Name',
+        'Organization',
+        'Organization Name',
+        'Salutation',
+        'Service Indicator',
+        'Social Media',
+        'Email',
+        'Phone',
+        'Address',
+        'Address Relation'
+    };
+    
+    global Integer index;
+    global String query; 
+
+    //Constructor to populate the query; the query should select all the records to delete
+    global BatchProcessDeltaRecords(Integer inputIndex) {
+        index = inputIndex;
+        query = 'SELECT Status__c FROM Migration_Packet__c WHERE RecordTypeId = \'012Uz000000h4WkIAI\' AND Status__c = \'Ready To Load\' AND Delta_Data_Load_type__c = \'' + objectToProcess.get(index) + '\'';
+    }
+
+    //Start method; execute the query to get the records to be deleted
+    global Database.QueryLocator start(Database.BatchableContext BC) {
+        System.debug('Loading index: ' + index + ' which corresponds to object ' + objectToProcess.get(index));
+        System.debug('query: ' + query);
+        return Database.getQueryLocator(query);
+    }
+
+    //Execute method; does the delete of the records
+    global void execute(Database.BatchableContext BC, List<Migration_Packet__c> listOfRecordsToUpdate) {
+        for(Migration_Packet__c record : listOfRecordsToUpdate) {
+            record.Status__c = 'New';
+        }
+        //Once update to records has been made, commit them to the database
+        Database.update(listOfRecordsToUpdate);
+    }
+
+    //Finish method; post-batch run job tasks
+    global void finish(Database.BatchableContext BC) {
+        System.debug('old index: ' + index);
+        //Invoke next object to process
+        Integer newIndex = index + 1;
+        System.debug('New index: ' + newIndex);
+        //Escape loop, in case the iteration fails
+        if(newIndex == 0) {
+            System.debug('Error Condition: NewIndexSizeOfZero');
+        //If the index reaches the end of the array of objects to process, we've finished processing
+        }else if(newIndex >= objectToProcess.size()) {
+            System.debug('All Done');
+        //If index is 9 or 10, we are loading address; do a batch size of one for each
+        } else if(newIndex == 9 || newIndex == 10) {
+            BatchProcessDeltaRecords nextObjectBatch = new BatchProcessDeltaRecords(newIndex);
+            Database.executeBatch(nextObjectBatch, 1);
+        //If new index is anything other than 0, 9, 10 or end of array, process normally
+        } else {
+            BatchProcessDeltaRecords nextObjectBatch = new BatchProcessDeltaRecords(newIndex);
+            Database.executeBatch(nextObjectBatch, 20);
+        }
+
+    }
+}
