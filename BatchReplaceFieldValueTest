@@ -1,0 +1,56 @@
+/**
+ * This class contains unit tests for validating the behavior of Apex classes
+ * and triggers.
+ *
+ * Unit tests are class methods that verify whether a particular piece
+ * of code is working properly. Unit test methods take no arguments,
+ * commit no data to the database, and are flagged with the testMethod
+ * keyword in the method definition.
+ *
+ * All test methods in an org are executed whenever Apex code is deployed
+ * to a production org to confirm correctness, ensure code
+ * coverage, and prevent regressions. All Apex classes are
+ * required to have at least 75% code coverage in order to be deployed
+ * to a production org. In addition, all triggers must have some code coverage.
+ * 
+ * The @isTest class annotation indicates this class only contains test
+ * methods. Classes defined with the @isTest annotation do not count against
+ * the org size limit for all Apex scripts.
+ *
+ * See the Apex Language Reference for more information about Testing and Code Coverage.
+ */
+@isTest
+private class BatchReplaceFieldValueTest {
+
+    @testSetup
+    static void setupTestData() {
+        
+        // Create test Task
+        Task testTask = new Task(
+            Subject = 'Other',
+            Status = 'Open',
+            Priority = 'Normal'
+        );
+        insert testTask;
+
+    }
+
+
+    @IsTest
+    public static void testBatchReplaceFieldValue() {
+         Test.startTest();
+        
+        String query = 'SELECT Id, Status FROM Task';
+        Map<String, String> fieldValueSet = new Map<String, String>();
+        fieldValueSet.put('Status', 'Not Started');
+        BatchReplaceFieldValue batch = new BatchReplaceFieldValue(query, fieldValueSet);
+        Id batchId = Database.executeBatch(batch);
+
+        Test.stopTest();
+
+        // Verify that the field is changed
+        Task updatedRecord = [SELECT Id, Status FROM Task LIMIT 1];
+
+        System.assertEquals('Not Started', updatedRecord.Status, 'The Status should be updated to Not Started');
+    }
+}
