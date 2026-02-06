@@ -1,0 +1,23 @@
+@isTest
+public with sharing class BatchMassDeleteRecordsTest {
+    @isTest static void testBulkDelete() {
+        //Create 100 temp Test Case records to be deleted. We don't use standard accounts or contacts because Ascend has crazy irritating validation rules that require a bunch of
+        //data to be populated to them.
+        List<ucinn_ascendv2__Involvement_Value__c> listOfRecordsToDelete = new List<ucinn_ascendv2__Involvement_Value__c>();
+        for(Integer i =0; i<100; i++) {
+            ucinn_ascendv2__Involvement_Value__c newIV = new ucinn_ascendv2__Involvement_Value__c(
+                Name = 'TestIV',
+                ucinn_ascendv2__Involvement_Description__c = 'Chunky Monkey From Funkytown'
+            );
+            listOfRecordsToDelete.add(newIV);
+        }
+        insert listOfRecordsToDelete;
+
+        //Set up query using Batch Job constructor
+        String queryString = 'SELECT Id FROM ucinn_ascendv2__Involvement_Value__c WHERE Name = \'TestIV\'';
+        //Set up the batch job via constructor
+        BatchMassDeleteRecords batchDelete = new BatchMassDeleteRecords(queryString);
+        //Execute batch job
+        Database.executeBatch(batchDelete);
+    }
+}
